@@ -139,7 +139,13 @@ class Trainer:
         """Train the model for one epoch."""
         self.model.train()
 
-        metrics = {"loss": 0, "acc": 0, "time_per_batch": 0}
+        metrics = {
+            "loss": 0,
+            "acc": 0,
+            "time_per_batch": 0,
+            "loss_triplet": 0,
+            "num_triplets": 0,
+        }
 
         if self.model_type == "attention":
             metrics.update(
@@ -166,22 +172,45 @@ class Trainer:
 
             clip1 = batch["clip1"].to(self.device)
             clip2 = batch["clip2"].to(self.device)
+            video_ids = batch["video_id"].to(self.device)
 
             if self.scaler:
                 with torch.amp.autocast("cuda"):
                     if self.model_type == "attention":
                         output = self.model.compute_loss(
-                            clip1, clip2, extract_ratio=self.config["min_extract_ratio"]
+                            clip1,
+                            clip2,
+                            video_ids=video_ids,
+                            extract_ratio=self.config["min_extract_ratio"],
+                            use_triplet=True,
+                            triplet_weight=self.config.get("triplet_weight", 0.3),
                         )
                     else:  # 3D model
-                        output = self.model.compute_loss(clip1, clip2)
+                        output = self.model.compute_loss(
+                            clip1,
+                            clip2,
+                            video_ids=video_ids,
+                            use_triplet=True,
+                            triplet_weight=self.config.get("triplet_weight", 0.3),
+                        )
             else:
                 if self.model_type == "attention":
                     output = self.model.compute_loss(
-                        clip1, clip2, extract_ratio=self.config["min_extract_ratio"]
+                        clip1,
+                        clip2,
+                        video_ids=video_ids,
+                        extract_ratio=self.config["min_extract_ratio"],
+                        use_triplet=True,
+                        triplet_weight=self.config.get("triplet_weight", 0.3),
                     )
                 else:  # 3D model
-                    output = self.model.compute_loss(clip1, clip2)
+                    output = self.model.compute_loss(
+                        clip1,
+                        clip2,
+                        video_ids=video_ids,
+                        use_triplet=True,
+                        triplet_weight=self.config.get("triplet_weight", 0.3),
+                    )
 
             loss = output["loss"]
 
@@ -217,6 +246,8 @@ class Trainer:
                         if key in metrics:
                             metrics[key] += output[key].item()
                 metrics["acc"] += acc.item()
+                metrics["loss_triplet"] += output.get("loss_triplet", 0).item()
+                metrics["num_triplets"] += output.get("num_triplets", 0)
                 num_batches += 1
 
                 if self.model_type == "attention":
@@ -228,6 +259,7 @@ class Trainer:
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{acc.item():.3f}",
+                        "triplet": f"{output.get('loss_triplet', 0):.3f}",
                         "lr": f"{current_lr:.2e}",
                         "time": f"{batch_time:.2f}s",
                     }
@@ -597,6 +629,14 @@ def main():
     parser.add_argument(
         "--frame_stride", type=int, default=16, help="Frame stride for 3D model"
     )
+    parser.add_argument(
+        '--triplet_weight', type=float, default=0.3,
+        help='Weight for triplet loss (default: 0.3)'
+    )
+    parser.add_argument(
+        '--triplet_margin', type=float, default=0.3,
+        help='Margin for triplet loss (default: 0.3)'
+    )
 
     args = parser.parse_args()
 
@@ -633,6 +673,8 @@ def main():
         "num_workers": args.num_workers,
         "model_type": args.model,
         "command_line": " ".join(sys.argv),
+        'triplet_weight': args.triplet_weight,
+        'triplet_margin': args.triplet_margin,
     }
 
     from model import create_model

@@ -5,6 +5,72 @@ from einops import rearrange, reduce
 import math
 
 
+def compute_triplet_loss(embeddings, video_ids, margin=0.3, hard_mining=True):
+    """
+    Compute triplet loss with hard mining.
+
+    Args:
+        embeddings: Tensor of shape (B, D) containing embeddings
+        video_ids: Tensor of shape (B,) containing video IDs
+        margin: Margin for triplet loss
+        hard_mining: If True, use hard triplet mining
+
+    Returns:
+        triplet_loss: Scalar tensor
+        num_valid_triplets: Number of valid triplets found
+    """
+    device = embeddings.device
+    batch_size = embeddings.shape[0]
+
+    distances = torch.cdist(embeddings, embeddings, p=2)
+
+    video_ids = video_ids.unsqueeze(0)  # (1, B)
+    positive_mask = video_ids.T == video_ids  # (B, B)
+    positive_mask.fill_diagonal_(False)  # Exclude self
+
+    negative_mask = ~positive_mask
+    negative_mask.fill_diagonal_(False)
+
+    triplet_loss = 0
+    num_valid_triplets = 0
+
+    for i in range(batch_size):
+        if positive_mask[i].sum() == 0:
+            continue
+
+        pos_distances = distances[i][positive_mask[i]]
+
+        neg_distances = distances[i][negative_mask[i]]
+
+        if len(neg_distances) == 0:
+            continue
+
+        if hard_mining:
+            hardest_positive_dist = pos_distances.max()
+
+            hardest_negative_dist = neg_distances.min()
+
+            loss = F.relu(hardest_positive_dist - hardest_negative_dist + margin)
+
+            if loss > 0:
+                triplet_loss += loss
+                num_valid_triplets += 1
+        else:
+            for pos_dist in pos_distances:
+                for neg_dist in neg_distances:
+                    loss = F.relu(pos_dist - neg_dist + margin)
+                    if loss > 0:
+                        triplet_loss += loss
+                        num_valid_triplets += 1
+
+    if num_valid_triplets > 0:
+        triplet_loss = triplet_loss / num_valid_triplets
+    else:
+        triplet_loss = torch.tensor(0.0, device=device)
+
+    return triplet_loss, num_valid_triplets
+
+
 class PositionalEncoding(nn.Module):
     """Positional encoding for temporal attention."""
 
@@ -231,13 +297,23 @@ class VideoFingerprintAttention(nn.Module):
             return embedding, temporal_features
         return embedding
 
-    def compute_loss(self, video1, video2, extract_ratio=0.5):
+    def compute_loss(
+        self,
+        video1,
+        video2,
+        video_ids=None,
+        extract_ratio=0.5,
+        use_triplet=True,
+        triplet_weight=0.3,
+    ):
         """
         Compute the contrastive loss with augmentation by extracting segments.
 
         Args:
             video1, video2: Pairs of videos (B, T, C, H, W)
             extract_ratio: Minimum ratio of frames to extract (0.5 = at least half)
+            use_triplet: Whether to use triplet loss
+            triplet_weight: Weight for triplet loss
         """
         B, T, C, H, W = video1.shape
 
@@ -285,11 +361,31 @@ class VideoFingerprintAttention(nn.Module):
 
         total_loss = loss_full + 0.5 * loss_extract + 0.3 * loss_extract_cross
 
+        triplet_loss = torch.tensor(0.0, device=video1.device)
+        num_triplets = 0
+
+        if use_triplet and video_ids is not None:
+            all_embeddings = torch.cat(
+                [emb_full_1, emb_full_2, emb_extract_1, emb_extract_2], dim=0
+            )
+
+            all_video_ids = torch.cat(
+                [video_ids, video_ids, video_ids, video_ids], dim=0
+            )
+
+            triplet_loss, num_triplets = compute_triplet_loss(
+                all_embeddings, all_video_ids, margin=0.3, hard_mining=True
+            )
+
+            total_loss = total_loss + triplet_weight * triplet_loss
+
         return {
-            "loss": total_loss / 3.6,
+            "loss": total_loss / (3.6 + triplet_weight),
             "loss_full": loss_full / 2,
             "loss_extract": loss_extract / 2,
             "loss_extract_cross": loss_extract_cross / 2,
+            "loss_triplet": triplet_loss,
+            "num_triplets": num_triplets,
             "temperature": self.temperature,
         }
 
@@ -415,7 +511,15 @@ class VideoFingerprint3D(nn.Module):
 
         return embedding
 
-    def compute_loss(self, video1, video2, hard_negative_ratio=0.3):
+    def compute_loss(
+        self,
+        video1,
+        video2,
+        video_ids=None,
+        hard_negative_ratio=0.3,
+        use_triplet=True,
+        triplet_weight=0.3,
+    ):
         """Compute contrastive loss between video pairs."""
         B = video1.shape[0]
 
@@ -455,10 +559,25 @@ class VideoFingerprint3D(nn.Module):
         # Total loss
         total_loss = (loss_12 + loss_21) / 2 + 0.5 * hard_loss
 
+        triplet_loss = torch.tensor(0.0, device=video1.device)
+        num_triplets = 0
+
+        if use_triplet and video_ids is not None:
+            all_embeddings = torch.cat([emb1, emb2], dim=0)
+            all_video_ids = torch.cat([video_ids, video_ids], dim=0)
+
+            triplet_loss, num_triplets = compute_triplet_loss(
+                all_embeddings, all_video_ids, margin=0.3, hard_mining=True
+            )
+
+            total_loss = total_loss + triplet_weight * triplet_loss
+
         return {
             "loss": total_loss,
             "loss_standard": (loss_12 + loss_21) / 2,
             "loss_hard": hard_loss,
+            "loss_triplet": triplet_loss,
+            "num_triplets": num_triplets,
             "temperature": self.temperature.item(),
         }
 
