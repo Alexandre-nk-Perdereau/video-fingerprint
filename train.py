@@ -88,6 +88,8 @@ class Trainer:
         self.best_auc_roc = 0.0
         self.epoch = 0
         self.global_step = 0
+        
+        self.visualizations_logged = False
 
         self._save_training_info()
 
@@ -137,6 +139,36 @@ class Trainer:
             f.write("\nCommand line arguments:\n")
             f.write(f"  {' '.join(sys.argv)}\n")
 
+    def _visualize_batch_transformations(self, batch):
+        """Visualize the transformations applied to a batch."""
+        print("\nLogging video transformations to TensorBoard...")
+        
+        clip1 = batch["clip1"]  # Shape: (B, T, C, H, W)
+        clip2 = batch["clip2"]  # Shape: (B, T, C, H, W)
+        video_ids = batch["video_id"]
+        
+        max_videos = min(8, clip1.shape[0])  # Max 8 vidéos
+        
+        for video_idx in range(max_videos):
+            video_clip1 = clip1[video_idx:video_idx+1]  # (1, T, C, H, W)
+            video_clip2 = clip2[video_idx:video_idx+1]  # (1, T, C, H, W)
+            
+            self.writer.add_video(
+                f'Videos/Video_{video_ids[video_idx]}/clip1',
+                video_clip1,
+                self.epoch,
+                fps=8
+            )
+            
+            self.writer.add_video(
+                f'Videos/Video_{video_ids[video_idx]}/clip2',
+                video_clip2,
+                self.epoch,
+                fps=8
+            )
+        
+        print(f"Videos logged for {max_videos} samples")
+
     def train_epoch(self):
         """Train the model for one epoch."""
         self.model.train()
@@ -169,7 +201,14 @@ class Trainer:
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
 
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
+            if self.epoch == 0 and batch_idx == 0 and not self.visualizations_logged:
+                try:
+                    self._visualize_batch_transformations(batch)
+                    self.visualizations_logged = True
+                except Exception as e:
+                    print(f"Could not log visualizations: {e}")
+            
             start_time = time.time()
 
             clip1 = batch["clip1"].to(self.device)
