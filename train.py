@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 import sys
 import time
+from sklearn.metrics import roc_auc_score
 
 
 class Trainer:
@@ -84,6 +85,7 @@ class Trainer:
 
         self.best_val_loss = float("inf")
         self.best_val_acc = 0.0
+        self.best_auc_roc = 0.0
         self.epoch = 0
         self.global_step = 0
 
@@ -281,6 +283,80 @@ class Trainer:
 
         return metrics
 
+    def compute_discrimination_metrics(
+        self, embeddings, video_ids, thresholds=[0.7, 0.8, 0.85, 0.9]
+    ):
+        """
+        Compute metrics for distinguishing between same and different videos.
+        This is crucial for duplicate detection.
+        """
+        similarities = np.dot(embeddings, embeddings.T)
+        n = len(embeddings)
+
+        video_ids_matrix = np.expand_dims(video_ids, 0)
+        same_video_mask = video_ids_matrix == video_ids_matrix.T
+        diff_video_mask = ~same_video_mask
+
+        np.fill_diagonal(same_video_mask, False)
+        np.fill_diagonal(diff_video_mask, False)
+
+        intra_similarities = similarities[same_video_mask]
+        inter_similarities = similarities[diff_video_mask]
+
+        metrics = {
+            "intra_sim_mean": np.mean(intra_similarities)
+            if len(intra_similarities) > 0
+            else 0,
+            "intra_sim_std": np.std(intra_similarities)
+            if len(intra_similarities) > 0
+            else 0,
+            "inter_sim_mean": np.mean(inter_similarities)
+            if len(inter_similarities) > 0
+            else 0,
+            "inter_sim_std": np.std(inter_similarities)
+            if len(inter_similarities) > 0
+            else 0,
+            "separation_gap": np.mean(intra_similarities) - np.mean(inter_similarities)
+            if len(intra_similarities) > 0 and len(inter_similarities) > 0
+            else 0,
+        }
+
+        for threshold in thresholds:
+            if len(intra_similarities) > 0 and len(inter_similarities) > 0:
+                tp = np.sum(intra_similarities >= threshold)  # True positives
+                fp = np.sum(inter_similarities >= threshold)  # False positives
+                fn = np.sum(intra_similarities < threshold)  # False negatives
+                tn = np.sum(inter_similarities < threshold)  # True negatives
+
+                precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+                f1 = (
+                    2 * precision * recall / (precision + recall)
+                    if (precision + recall) > 0
+                    else 0
+                )
+
+                metrics[f"precision@{threshold:.2f}"] = precision
+                metrics[f"recall@{threshold:.2f}"] = recall
+                metrics[f"f1@{threshold:.2f}"] = f1
+                metrics[f"fpr@{threshold:.2f}"] = fp / (fp + tn) if (fp + tn) > 0 else 0
+
+        # Compute AUC-ROC
+        if len(intra_similarities) > 0 and len(inter_similarities) > 0:
+            y_true = np.concatenate(
+                [np.ones(len(intra_similarities)), np.zeros(len(inter_similarities))]
+            )
+            y_scores = np.concatenate([intra_similarities, inter_similarities])
+
+            try:
+                metrics["auc_roc"] = roc_auc_score(y_true, y_scores)
+            except:
+                metrics["auc_roc"] = 0.5
+        else:
+            metrics["auc_roc"] = 0.5
+
+        return metrics
+
     def validate(self):
         self.model.eval()
 
@@ -348,6 +424,11 @@ class Trainer:
             all_embeddings, all_video_ids
         )
         metrics.update(retrieval_metrics)
+
+        discrimination_metrics = self.compute_discrimination_metrics(
+            all_embeddings.numpy(), np.array(all_video_ids)
+        )
+        metrics.update(discrimination_metrics)
 
         if self.model_type == "attention":
             extract_metrics = self._test_extract_robustness()
@@ -436,6 +517,24 @@ class Trainer:
 
         return metrics
 
+    def _convert_metrics_to_json_serializable(self, metrics):
+        """Convert numpy types to native Python types for JSON serialization."""
+        if isinstance(metrics, dict):
+            return {
+                k: self._convert_metrics_to_json_serializable(v)
+                for k, v in metrics.items()
+            }
+        elif isinstance(metrics, (list, tuple)):
+            return [self._convert_metrics_to_json_serializable(v) for v in metrics]
+        elif isinstance(metrics, (np.integer, np.int64, np.int32)):
+            return int(metrics)
+        elif isinstance(metrics, (np.floating, np.float32, np.float64)):
+            return float(metrics)
+        elif isinstance(metrics, np.ndarray):
+            return metrics.tolist()
+        else:
+            return metrics
+
     def save_checkpoint(self, is_best=False, metrics=None):
         checkpoint = {
             "epoch": self.epoch,
@@ -445,6 +544,7 @@ class Trainer:
             "scheduler_state_dict": self.scheduler.state_dict(),
             "best_val_loss": self.best_val_loss,
             "best_val_acc": self.best_val_acc,
+            "best_auc_roc": self.best_auc_roc,
             "config": self.config,
             "metrics": metrics,
         }
@@ -454,16 +554,18 @@ class Trainer:
         if is_best:
             torch.save(checkpoint, self.checkpoint_dir / "best.pth")
             if metrics:
+                json_metrics = self._convert_metrics_to_json_serializable(metrics)
                 metrics_path = self.checkpoint_dir / "best_metrics.json"
                 with open(metrics_path, "w") as f:
-                    json.dump(metrics, f, indent=2)
+                    json.dump(json_metrics, f, indent=2)
 
         if self.epoch % 5 == 0:
             torch.save(checkpoint, self.checkpoint_dir / f"epoch_{self.epoch}.pth")
             if metrics:
+                json_metrics = self._convert_metrics_to_json_serializable(metrics)
                 metrics_path = self.checkpoint_dir / f"epoch_{self.epoch}_metrics.json"
                 with open(metrics_path, "w") as f:
-                    json.dump(metrics, f, indent=2)
+                    json.dump(json_metrics, f, indent=2)
 
     def _update_training_log(self, train_metrics, val_metrics, is_best):
         """Update the training log file with latest results."""
@@ -471,20 +573,22 @@ class Trainer:
 
         with open(log_path, "a") as f:
             if self.epoch == 0:
-                f.write("\n" + "=" * 80 + "\n")
+                f.write("\n" + "=" * 130 + "\n")
                 f.write(
-                    "Epoch | Train Loss | Train Acc | Val Loss | Val Acc | R@1  | R@5  | mAP  | Best\n"
+                    "Epoch | Train Loss | Train Acc | Val Loss | Val Acc | AUC-ROC | Intra Sim | Inter Sim | F1@0.7 | F1@0.8 | Best\n"
                 )
-                f.write("-" * 80 + "\n")
+                f.write("-" * 130 + "\n")
 
             f.write(f"{self.epoch:5d} | ")
             f.write(f"{train_metrics['loss']:10.4f} | ")
             f.write(f"{train_metrics['acc']:9.3f} | ")
             f.write(f"{val_metrics['loss']:8.4f} | ")
             f.write(f"{val_metrics['acc']:7.3f} | ")
-            f.write(f"{val_metrics.get('R@1', 0):4.2f} | ")
-            f.write(f"{val_metrics.get('R@5', 0):4.2f} | ")
-            f.write(f"{val_metrics.get('mAP', 0):4.2f} | ")
+            f.write(f"{val_metrics.get('auc_roc', 0):7.3f} | ")
+            f.write(f"{val_metrics.get('intra_sim_mean', 0):9.3f} | ")
+            f.write(f"{val_metrics.get('inter_sim_mean', 0):9.3f} | ")
+            f.write(f"{val_metrics.get('f1@0.70', 0):6.3f} | ")
+            f.write(f"{val_metrics.get('f1@0.80', 0):6.3f} | ")
             f.write(f"{'V' if is_best else 'X'}\n")
 
     def train(self):
@@ -509,21 +613,39 @@ class Trainer:
             if self.model_type == "3d":
                 self.scheduler.step()
 
-            print(f"\n{'=' * 50}")
+            print(f"\n{'=' * 80}")
             print(f"Epoch {epoch}/{self.config['epochs']}")
             print(
-                f"Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['acc']:.3f}, Time/batch: {train_metrics['time_per_batch']:.2f}s"
+                f"Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['acc']:.3f}"
             )
             print(
                 f"Val   - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['acc']:.3f}"
             )
+            print("\nDuplicate Detection Metrics:")
+            print(f"  AUC-ROC: {val_metrics.get('auc_roc', 0):.3f}")
             print(
-                f"Val   - R@1: {val_metrics.get('R@1', 0):.3f}, R@5: {val_metrics.get('R@5', 0):.3f}, mAP: {val_metrics.get('mAP', 0):.3f}"
+                f"  Intra-video similarity: {val_metrics.get('intra_sim_mean', 0):.3f} ± {val_metrics.get('intra_sim_std', 0):.3f}"
             )
+            print(
+                f"  Inter-video similarity: {val_metrics.get('inter_sim_mean', 0):.3f} ± {val_metrics.get('inter_sim_std', 0):.3f}"
+            )
+            print(f"  Separation gap: {val_metrics.get('separation_gap', 0):.3f}")
+
+            print(f"\nPerformance at threshold 0.70:")
+            print(f"  Precision: {val_metrics.get('precision@0.70', 0):.3f}")
+            print(f"  Recall: {val_metrics.get('recall@0.70', 0):.3f}")
+            print(f"  F1-score: {val_metrics.get('f1@0.70', 0):.3f}")
+            print(f"  FPR: {val_metrics.get('fpr@0.70', 0):.3f}")
+
+            print(f"\nPerformance at threshold 0.80:")
+            print(f"  Precision: {val_metrics.get('precision@0.80', 0):.3f}")
+            print(f"  Recall: {val_metrics.get('recall@0.80', 0):.3f}")
+            print(f"  F1-score: {val_metrics.get('f1@0.80', 0):.3f}")
+            print(f"  FPR: {val_metrics.get('fpr@0.80', 0):.3f}")
 
             if self.model_type == "attention":
                 print(
-                    f"Extract Robustness - 50%: {val_metrics.get('extract_sim_50', 0):.3f}, 70%: {val_metrics.get('extract_sim_70', 0):.3f}"
+                    f"\nExtract Robustness - 50%: {val_metrics.get('extract_sim_50', 0):.3f}, 70%: {val_metrics.get('extract_sim_70', 0):.3f}"
                 )
 
             for key, value in train_metrics.items():
@@ -531,15 +653,18 @@ class Trainer:
             for key, value in val_metrics.items():
                 self.writer.add_scalar(f"Val/{key}", value, epoch)
 
-            is_best = val_metrics["acc"] > self.best_val_acc
+            auc_roc = val_metrics.get("auc_roc", 0)
+            is_best = auc_roc > self.best_auc_roc
+
             if is_best:
+                self.best_auc_roc = auc_roc
                 self.best_val_acc = val_metrics["acc"]
                 self.best_val_loss = val_metrics["loss"]
-                print(f"🏆 New best validation accuracy: {val_metrics['acc']:.3f}")
+                print(f"\n🏆 New best AUC-ROC: {auc_roc:.3f}")
                 patience_counter = 0
             else:
                 patience_counter += 1
-                print(f"Early stopping patience: {patience_counter}/{patience}")
+                print(f"\nEarly stopping patience: {patience_counter}/{patience}")
 
             all_metrics = {
                 "train": train_metrics,
@@ -549,10 +674,9 @@ class Trainer:
             self.save_checkpoint(is_best, metrics=all_metrics)
             self._update_training_log(train_metrics, val_metrics, is_best)
 
-            if epoch > 20 and val_metrics["acc"] < 0.5:
-                print(
-                    "WARNING: Low accuracy after 20 epochs, consider checking data/model"
-                )
+            if val_metrics.get("separation_gap", 0) < 0.1:
+                print("\nWARNING: Poor separation between same and different videos!")
+                print("   Consider adjusting loss functions or model architecture.")
 
             if patience_counter >= patience:
                 print(
@@ -569,6 +693,7 @@ class Trainer:
             )
             f.write(f"Model type: {self.model_type}\n")
             f.write(f"Total epochs: {self.epoch + 1}\n")
+            f.write(f"Best AUC-ROC: {self.best_auc_roc:.4f}\n")
             f.write(f"Best validation accuracy: {self.best_val_acc:.4f}\n")
             f.write(f"Best validation loss: {self.best_val_loss:.4f}\n")
             f.write(f"Final checkpoint: {self.checkpoint_dir / 'last.pth'}\n")
@@ -586,7 +711,7 @@ def setup_run_directory(base_dir="./runs", prefix=""):
     run_dir.mkdir(parents=True, exist_ok=True)
 
     latest_link = Path(base_dir) / "latest"
-    if latest_link.exists():
+    if latest_link.exists() or latest_link.is_symlink():
         latest_link.unlink()
     latest_link.symlink_to(run_dir.name)
 
@@ -630,12 +755,16 @@ def main():
         "--frame_stride", type=int, default=16, help="Frame stride for 3D model"
     )
     parser.add_argument(
-        '--triplet_weight', type=float, default=0.3,
-        help='Weight for triplet loss (default: 0.3)'
+        "--triplet_weight",
+        type=float,
+        default=0.3,
+        help="Weight for triplet loss (default: 0.3)",
     )
     parser.add_argument(
-        '--triplet_margin', type=float, default=0.3,
-        help='Margin for triplet loss (default: 0.3)'
+        "--triplet_margin",
+        type=float,
+        default=0.3,
+        help="Margin for triplet loss (default: 0.3)",
     )
 
     args = parser.parse_args()
@@ -673,8 +802,8 @@ def main():
         "num_workers": args.num_workers,
         "model_type": args.model,
         "command_line": " ".join(sys.argv),
-        'triplet_weight': args.triplet_weight,
-        'triplet_margin': args.triplet_margin,
+        "triplet_weight": args.triplet_weight,
+        "triplet_margin": args.triplet_margin,
     }
 
     from model import create_model
@@ -726,6 +855,7 @@ def main():
         trainer.global_step = checkpoint["global_step"]
         trainer.best_val_loss = checkpoint["best_val_loss"]
         trainer.best_val_acc = checkpoint["best_val_acc"]
+        trainer.best_auc_roc = checkpoint.get("best_auc_roc", 0.0)
         print(f"Resumed from epoch {trainer.epoch}")
 
         with open(trainer.run_dir / "training_info.txt", "a") as f:
