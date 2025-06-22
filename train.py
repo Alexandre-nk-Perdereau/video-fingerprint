@@ -8,14 +8,17 @@ from tqdm import tqdm
 import torch.nn.functional as F
 import argparse
 from datetime import datetime
+import json
+import sys
 
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, config):
+    def __init__(self, model, train_loader, val_loader, config, run_dir):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
+        self.run_dir = Path(run_dir)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -62,14 +65,51 @@ class Trainer:
 
         self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
-        self.writer = SummaryWriter(config["log_dir"])
-        self.checkpoint_dir = Path(config["checkpoint_dir"])
+        self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.writer = SummaryWriter(self.run_dir / "tensorboard")
 
         self.best_val_loss = float("inf")
         self.best_val_acc = 0.0
         self.epoch = 0
         self.global_step = 0
+
+        self._save_training_info()
+
+    def _save_training_info(self):
+        """Save training configuration and information."""
+        config_path = self.run_dir / "config.json"
+        with open(config_path, "w") as f:
+            json.dump(self.config, f, indent=2)
+
+        info_path = self.run_dir / "training_info.txt"
+        with open(info_path, "w") as f:
+            f.write(
+                f"Training started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            f.write(f"Device: {self.device}\n")
+            f.write(
+                f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}\n"
+            )
+            f.write(
+                f"Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}\n"
+            )
+            f.write("\nModel Architecture:\n")
+            f.write(f"  - Spatial dimension: {self.config.get('spatial_dim', 128)}\n")
+            f.write(f"  - Temporal dimension: {self.config.get('temporal_dim', 256)}\n")
+            f.write(f"  - Embedding dimension: {self.config['embedding_dim']}\n")
+            f.write(
+                f"  - Number of attention blocks: {self.config.get('num_attention_blocks', 4)}\n"
+            )
+            f.write("\nData Configuration:\n")
+            f.write(f"  - Frame size: {self.config['frame_size']}\n")
+            f.write(f"  - Max frames: {self.config['max_frames']}\n")
+            f.write(f"  - Batch size: {self.config['batch_size']}\n")
+            f.write(f"  - Number of training batches: {len(self.train_loader)}\n")
+            f.write(f"  - Number of validation batches: {len(self.val_loader)}\n")
+            f.write("\nCommand line arguments:\n")
+            f.write(f"  {' '.join(sys.argv)}\n")
 
     def train_epoch(self):
         """Train the model for one epoch."""
@@ -114,8 +154,7 @@ class Trainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-            if self.global_step > 0:
-                self.scheduler.step()
+            self.scheduler.step()
 
             with torch.no_grad():
                 emb1 = self.model(clip1)
@@ -296,7 +335,7 @@ class Trainer:
 
         return metrics
 
-    def save_checkpoint(self, is_best=False):
+    def save_checkpoint(self, is_best=False, metrics=None):
         checkpoint = {
             "epoch": self.epoch,
             "global_step": self.global_step,
@@ -306,15 +345,46 @@ class Trainer:
             "best_val_loss": self.best_val_loss,
             "best_val_acc": self.best_val_acc,
             "config": self.config,
+            "metrics": metrics,
         }
 
         torch.save(checkpoint, self.checkpoint_dir / "last.pth")
 
         if is_best:
             torch.save(checkpoint, self.checkpoint_dir / "best.pth")
+            if metrics:
+                metrics_path = self.checkpoint_dir / "best_metrics.json"
+                with open(metrics_path, "w") as f:
+                    json.dump(metrics, f, indent=2)
 
         if self.epoch % 5 == 0:
             torch.save(checkpoint, self.checkpoint_dir / f"epoch_{self.epoch}.pth")
+            if metrics:
+                metrics_path = self.checkpoint_dir / f"epoch_{self.epoch}_metrics.json"
+                with open(metrics_path, "w") as f:
+                    json.dump(metrics, f, indent=2)
+
+    def _update_training_log(self, train_metrics, val_metrics, is_best):
+        """Update the training log file with latest results."""
+        log_path = self.run_dir / "training_log.txt"
+
+        with open(log_path, "a") as f:
+            if self.epoch == 0:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write(
+                    "Epoch | Train Loss | Train Acc | Val Loss | Val Acc | R@1  | R@5  | mAP  | Best\n"
+                )
+                f.write("-" * 80 + "\n")
+
+            f.write(f"{self.epoch:5d} | ")
+            f.write(f"{train_metrics['loss']:10.4f} | ")
+            f.write(f"{train_metrics['acc']:9.3f} | ")
+            f.write(f"{val_metrics['loss']:8.4f} | ")
+            f.write(f"{val_metrics['acc']:7.3f} | ")
+            f.write(f"{val_metrics.get('R@1', 0):4.2f} | ")
+            f.write(f"{val_metrics.get('R@5', 0):4.2f} | ")
+            f.write(f"{val_metrics.get('mAP', 0):4.2f} | ")
+            f.write(f"{'✓' if is_best else ' '}\n")
 
     def train(self):
         print(f"Training on {self.device}")
@@ -322,6 +392,8 @@ class Trainer:
         print(
             f"Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}"
         )
+        print(f"\nRun directory: {self.run_dir}")
+        print(f"Checkpoints will be saved to: {self.checkpoint_dir}")
 
         patience = self.config.get("patience", 10)
         patience_counter = 0
@@ -362,7 +434,13 @@ class Trainer:
                 patience_counter += 1
                 print(f"Early stopping patience: {patience_counter}/{patience}")
 
-            self.save_checkpoint(is_best)
+            all_metrics = {
+                "train": train_metrics,
+                "val": val_metrics,
+                "epoch": epoch,
+            }
+            self.save_checkpoint(is_best, metrics=all_metrics)
+            self._update_training_log(train_metrics, val_metrics, is_best)
 
             if epoch > 20 and val_metrics["acc"] < 0.5:
                 print(
@@ -376,7 +454,35 @@ class Trainer:
                 break
 
         self.writer.close()
+
+        summary_path = self.run_dir / "training_summary.txt"
+        with open(summary_path, "w") as f:
+            f.write(
+                f"Training completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            )
+            f.write(f"Total epochs: {self.epoch + 1}\n")
+            f.write(f"Best validation accuracy: {self.best_val_acc:.4f}\n")
+            f.write(f"Best validation loss: {self.best_val_loss:.4f}\n")
+            f.write(f"Final checkpoint: {self.checkpoint_dir / 'last.pth'}\n")
+            f.write(f"Best checkpoint: {self.checkpoint_dir / 'best.pth'}\n")
+
         print("\n✅ Training completed!")
+        print(f"Results saved to: {self.run_dir}")
+
+
+def setup_run_directory(base_dir="./runs"):
+    """Create a unique run directory with timestamp."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = f"run_{timestamp}"
+    run_dir = Path(base_dir) / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    latest_link = Path(base_dir) / "latest"
+    if latest_link.exists():
+        latest_link.unlink()
+    latest_link.symlink_to(run_dir.name)
+
+    return run_dir
 
 
 def main():
@@ -396,8 +502,20 @@ def main():
     parser.add_argument(
         "--no_amp", action="store_true", help="Disable mixed precision training"
     )
+    parser.add_argument(
+        "--run_name", type=str, help="Custom run name (default: timestamp)"
+    )
+    parser.add_argument(
+        "--patience", type=int, default=10, help="Early stopping patience"
+    )
 
     args = parser.parse_args()
+
+    if args.run_name:
+        run_dir = Path("./runs") / args.run_name
+        run_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        run_dir = setup_run_directory()
 
     config = {
         "batch_size": args.batch_size,
@@ -409,20 +527,25 @@ def main():
         "frame_size": 64,
         "max_frames": 500,
         "embedding_dim": 256,
+        "spatial_dim": 128,
+        "temporal_dim": 256,
+        "num_attention_blocks": 4,
         "min_extract_ratio": 0.5,
         "use_amp": not args.no_amp,
-        "log_dir": f"./runs/video_attention_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-        "checkpoint_dir": "./checkpoints",
+        "patience": args.patience,
+        "data_dir": str(args.data_dir),
+        "num_workers": args.num_workers,
+        "command_line": " ".join(sys.argv),
     }
 
     from model import create_attention_model
     from dataset import create_dataloader
 
     model = create_attention_model(
-        spatial_dim=128,
-        temporal_dim=256,
+        spatial_dim=config["spatial_dim"],
+        temporal_dim=config["temporal_dim"],
         embedding_dim=config["embedding_dim"],
-        num_attention_blocks=4,
+        num_attention_blocks=config["num_attention_blocks"],
     )
 
     train_loader = create_dataloader(
@@ -443,7 +566,7 @@ def main():
         mode="val",
     )
 
-    trainer = Trainer(model, train_loader, val_loader, config)
+    trainer = Trainer(model, train_loader, val_loader, config, run_dir)
 
     if args.checkpoint:
         checkpoint = torch.load(args.checkpoint, map_location=trainer.device)
@@ -455,6 +578,10 @@ def main():
         trainer.best_val_loss = checkpoint["best_val_loss"]
         trainer.best_val_acc = checkpoint["best_val_acc"]
         print(f"Resumed from epoch {trainer.epoch}")
+
+        with open(trainer.run_dir / "training_info.txt", "a") as f:
+            f.write(f"\n\nResumed from checkpoint: {args.checkpoint}\n")
+            f.write(f"Resumed at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
     trainer.train()
 
