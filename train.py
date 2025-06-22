@@ -752,7 +752,7 @@ def main():
         "--clip_length", type=int, default=128, help="Clip length for 3D model"
     )
     parser.add_argument(
-        "--frame_stride", type=int, default=16, help="Frame stride for 3D model"
+        "--frame_stride", type=int, default=32, help="Frame stride for 3D model"
     )
     parser.add_argument(
         "--triplet_weight",

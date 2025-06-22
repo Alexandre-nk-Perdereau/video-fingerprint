@@ -37,7 +37,7 @@ class VideoFingerprintScanner:
         self.frame_size = self.config.get("frame_size", 64)
         self.max_frames = self.config.get("max_frames", 500)
         self.clip_length = self.config.get("clip_length", 128)
-        self.frame_stride = self.config.get("frame_stride", 16)
+        self.frame_stride = self.config.get("frame_stride", 32)
         self.embedding_dim = self.config.get("embedding_dim", 256)
 
         print(f"Model loaded - Type: {self.model_type}, Device: {self.device}")
@@ -64,7 +64,7 @@ class VideoFingerprintScanner:
             temporal_dim=config.get("temporal_dim", 256),
             embedding_dim=config.get("embedding_dim", 256),
             num_attention_blocks=config.get("num_attention_blocks", 4),
-            frame_stride=config.get("frame_stride", 16),
+            frame_stride=config.get("frame_stride", 32),
         )
 
         model.load_state_dict(checkpoint["model_state_dict"])

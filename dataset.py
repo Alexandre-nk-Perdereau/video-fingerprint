@@ -21,7 +21,7 @@ class VideoFingerprintDataset(Dataset):
         frame_size=64,
         max_frames=1000,
         clip_length=128,  # For 3D CNN mode
-        frame_stride=16,  # For 3D CNN mode
+        frame_stride=32,  # For 3D CNN mode
         min_extract_ratio=0.5,
         augment=True,
         cache_videos=True,
@@ -124,7 +124,14 @@ class VideoFingerprintDataset(Dataset):
             if total_frames == 0:
                 total_frames = int(stream.duration * stream.average_rate)
 
-            skip_rate = max(1, total_frames // self.max_frames)
+            # Simulate variable frame rate by changing skip rate
+            if self.augment and self.mode == "train":
+                speed_factor = random.uniform(0.5, 2.0)
+                skip_rate = max(
+                    1, int((total_frames // self.max_frames) * speed_factor)
+                )
+            else:
+                skip_rate = max(1, total_frames // self.max_frames)
 
             container.seek(0)
             stream.codec_context.skip_frame = "DEFAULT"
@@ -187,9 +194,35 @@ class VideoFingerprintDataset(Dataset):
 
         return frames[:num_frames]
 
-    def _resize_frame(self, frame):
-        """Center crop and resize frame to target size."""
+    def _resize_frame(self, frame, apply_resolution_change=False):
+        """Resize frame with optional resolution degradation."""
         h, w = frame.shape[:2]
+
+        if apply_resolution_change and self.augment and random.random() > 0.5:
+            resolutions = [
+                (480, 640),
+                (720, 1280),
+                (1080, 1920),
+                (360, 640),
+            ]
+            target_h, target_w = random.choice(resolutions)
+
+            if h > target_h or w > target_w:
+                scale = min(target_h / h, target_w / w)
+                new_h, new_w = int(h * scale), int(w * scale)
+                frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                h, w = new_h, new_w
+
+        if self.augment and random.random() > 0.3:
+            crop_ratio = random.uniform(0.8, 1.0)
+            crop_h = int(h * crop_ratio)
+            crop_w = int(w * crop_ratio)
+
+            start_h = random.randint(0, h - crop_h)
+            start_w = random.randint(0, w - crop_w)
+
+            frame = frame[start_h : start_h + crop_h, start_w : start_w + crop_w]
+            h, w = crop_h, crop_w
 
         if h < w:
             new_h = self.frame_size
@@ -215,16 +248,22 @@ class VideoFingerprintDataset(Dataset):
             return frames
 
         do_color = random.random() > 0.3
-        brightness = random.uniform(0.8, 1.2) if do_color else 1.0
-        contrast = random.uniform(0.8, 1.2) if do_color else 1.0
-        saturation = random.uniform(0.8, 1.2) if do_color else 1.0
-
         do_flip = random.random() > 0.5
         do_noise = random.random() > 0.7
-        noise_level = random.uniform(0.01, 0.05) if do_noise else 0
-
         do_compression = random.random() > 0.5
-        jpeg_quality = random.randint(60, 95) if do_compression else 100
+        do_blur = random.random() > 0.5
+        do_letterbox = random.random() > 0.7
+        do_overlay = random.random() > 0.8
+        do_rotation = random.random() > 0.8
+
+        brightness = random.uniform(0.5, 1.5) if do_color else 1.0
+        contrast = random.uniform(0.5, 1.5) if do_color else 1.0
+        saturation = random.uniform(0.5, 1.5) if do_color else 1.0
+        hue_shift = random.uniform(-0.1, 0.1) if do_color else 0
+
+        noise_level = random.uniform(0.02, 0.1) if do_noise else 0
+        jpeg_quality = random.randint(30, 90) if do_compression else 100
+        blur_kernel = random.choice([3, 5, 7]) if do_blur else 0
 
         augmented = []
 
@@ -233,6 +272,17 @@ class VideoFingerprintDataset(Dataset):
 
             if do_color:
                 aug_frame = aug_frame.astype(np.float32) / 255.0
+
+                hsv = cv2.cvtColor(
+                    (aug_frame * 255).astype(np.uint8), cv2.COLOR_RGB2HSV
+                ).astype(np.float32)
+                hsv[:, :, 0] = (hsv[:, :, 0] + hue_shift * 180) % 180
+                aug_frame = (
+                    cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB).astype(
+                        np.float32
+                    )
+                    / 255.0
+                )
 
                 aug_frame = aug_frame * brightness
 
@@ -255,12 +305,48 @@ class VideoFingerprintDataset(Dataset):
                     aug_frame.astype(np.float32) + noise, 0, 255
                 ).astype(np.uint8)
 
-            if do_compression and random.random() > 0.5:
+            if do_blur:
+                aug_frame = cv2.GaussianBlur(aug_frame, (blur_kernel, blur_kernel), 0)
+
+            if do_compression:
                 encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
                 _, encimg = cv2.imencode(
                     ".jpg", cv2.cvtColor(aug_frame, cv2.COLOR_RGB2BGR), encode_param
                 )
                 aug_frame = cv2.cvtColor(cv2.imdecode(encimg, 1), cv2.COLOR_BGR2RGB)
+
+            if do_letterbox:
+                bar_size = random.randint(5, 15)  # pixels
+                if random.random() > 0.5:  # Top and bottom
+                    aug_frame[:bar_size, :] = 0
+                    aug_frame[-bar_size:, :] = 0
+                else:  # Left and right
+                    aug_frame[:, :bar_size] = 0
+                    aug_frame[:, -bar_size:] = 0
+
+            if do_overlay:
+                overlay_h = random.randint(10, 20)
+                overlay_w = random.randint(30, 60)
+                overlay_y = random.randint(0, self.frame_size - overlay_h)
+                overlay_x = random.randint(0, self.frame_size - overlay_w)
+
+                # Semi-transparent white rectangle
+                overlay_region = aug_frame[
+                    overlay_y : overlay_y + overlay_h, overlay_x : overlay_x + overlay_w
+                ]
+                white_overlay = np.ones_like(overlay_region) * 255
+                alpha = 0.3
+                aug_frame[
+                    overlay_y : overlay_y + overlay_h, overlay_x : overlay_x + overlay_w
+                ] = (1 - alpha) * overlay_region + alpha * white_overlay
+
+            if do_rotation:
+                angle = random.uniform(-5, 5)  # degrees
+                center = (self.frame_size // 2, self.frame_size // 2)
+                M = cv2.getRotationMatrix2D(center, angle, 1.0)
+                aug_frame = cv2.warpAffine(
+                    aug_frame, M, (self.frame_size, self.frame_size)
+                )
 
             augmented.append(aug_frame)
 
@@ -277,13 +363,28 @@ class VideoFingerprintDataset(Dataset):
             len2 = random.randint(min_length, n_frames)
 
             start1 = random.randint(0, n_frames - len1)
-            start2 = random.randint(0, n_frames - len2)
 
-            if random.random() > 0.3:
-                overlap_frames = random.randint(min_length // 2, min(len1, len2))
+            duplicate_type = random.random()
+
+            if duplicate_type < 0.33:  # 33% - exact temporal overlap
+                start2 = start1
+                len2 = len1
+            elif duplicate_type < 0.66:  # 33% - partial overlap
+                overlap_frames = random.randint(min_length // 3, min(len1, len2) // 2)
                 max_offset = min(len1, len2) - overlap_frames
                 offset = random.randint(-max_offset, max_offset)
                 start2 = max(0, min(start1 + offset, n_frames - len2))
+            else:  # 33% - simulate trimmed/extended versions
+                if random.random() > 0.5:
+                    # Trimmed version
+                    start2 = start1 + random.randint(0, max(1, len1 // 4))
+                    len2 = len1 - random.randint(0, max(1, len1 // 4))
+                else:
+                    # Extended version
+                    start2 = max(0, start1 - random.randint(0, max(1, len1 // 4)))
+                    len2 = min(
+                        n_frames - start2, len1 + random.randint(0, max(1, len1 // 4))
+                    )
 
             extract1 = frames[start1 : start1 + len1]
             extract2 = frames[start2 : start2 + len2]
@@ -334,8 +435,8 @@ class VideoFingerprintDataset(Dataset):
         all_frames = self._load_video_full(video_path)
         frames1, frames2 = self._create_extract_pair(all_frames)
 
-        frames1 = [self._resize_frame(f) for f in frames1]
-        frames2 = [self._resize_frame(f) for f in frames2]
+        frames1 = [self._resize_frame(f, apply_resolution_change=True) for f in frames1]
+        frames2 = [self._resize_frame(f, apply_resolution_change=True) for f in frames2]
 
         frames1 = self._apply_augmentations(frames1)
         frames2 = self._apply_augmentations(frames2)
@@ -347,8 +448,8 @@ class VideoFingerprintDataset(Dataset):
         clip2 = clip2.permute(0, 3, 1, 2)
 
         return {
-            "clip1": clip1,  # (T1, C, H, W)
-            "clip2": clip2,  # (T2, C, H, W)
+            "clip1": clip1,
+            "clip2": clip2,
             "video_id": sample_info["video_id"],
             "lengths": torch.tensor([len(frames1), len(frames2)]),
         }
@@ -361,18 +462,23 @@ class VideoFingerprintDataset(Dataset):
         start1 = self._get_clip_start_position(clip_info)
         start2 = self._get_clip_start_position(clip_info)
 
-        if self.mode == "train" and random.random() > 0.3:
-            max_offset = self.clip_length // 2
-            offset = random.randint(-max_offset, max_offset)
-            start2 = max(
-                0, min(start1 + offset, clip_info["total_frames"] - self.clip_length)
-            )
+        if self.mode == "train":
+            duplicate_type = random.random()
+            if duplicate_type < 0.4:  # Exact same clip
+                start2 = start1
+            else:  # Overlapping clips
+                max_offset = self.clip_length // 3
+                offset = random.randint(-max_offset, max_offset)
+                start2 = max(
+                    0,
+                    min(start1 + offset, clip_info["total_frames"] - self.clip_length),
+                )
 
         frames1 = self._load_clip_frames(video_path, start1, self.clip_length)
         frames2 = self._load_clip_frames(video_path, start2, self.clip_length)
 
-        frames1 = [self._resize_frame(f) for f in frames1]
-        frames2 = [self._resize_frame(f) for f in frames2]
+        frames1 = [self._resize_frame(f, apply_resolution_change=True) for f in frames1]
+        frames2 = [self._resize_frame(f, apply_resolution_change=True) for f in frames2]
 
         frames1 = self._apply_augmentations(frames1)
         frames2 = self._apply_augmentations(frames2)
@@ -380,7 +486,6 @@ class VideoFingerprintDataset(Dataset):
         clip1 = torch.from_numpy(np.stack(frames1)).float() / 255.0
         clip2 = torch.from_numpy(np.stack(frames2)).float() / 255.0
 
-        # (T, H, W, C) -> (T, C, H, W)
         clip1 = clip1.permute(0, 3, 1, 2)
         clip2 = clip2.permute(0, 3, 1, 2)
 
@@ -417,8 +522,8 @@ def collate_fn_padding(batch):
             clip_padded = clip
         clips2_padded.append(clip_padded)
 
-    clips1_batch = torch.stack(clips1_padded)  # (B, T, C, H, W)
-    clips2_batch = torch.stack(clips2_padded)  # (B, T, C, H, W)
+    clips1_batch = torch.stack(clips1_padded)
+    clips2_batch = torch.stack(clips2_padded)
 
     return {"clip1": clips1_batch, "clip2": clips2_batch, "video_id": video_ids}
 
