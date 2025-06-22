@@ -310,9 +310,8 @@ class Conv3DBlock(nn.Module):
 class VideoFingerprint3D(nn.Module):
     """Fast 3D CNN model for video fingerprinting with temporal striding."""
 
-    def __init__(self, embedding_dim=256, frame_stride=16, dropout=0.2):
+    def __init__(self, embedding_dim=256, frame_stride=32, dropout=0.2):
         super().__init__()
-
         self.frame_stride = frame_stride
         self.embedding_dim = embedding_dim
 
@@ -320,39 +319,39 @@ class VideoFingerprint3D(nn.Module):
             # First layer: aggressive temporal stride
             Conv3DBlock(
                 3,
-                64,
+                16,
                 kernel_size=(frame_stride, 5, 5),
                 stride=(frame_stride, 2, 2),
                 padding=(0, 2, 2),
             ),
-            # Output: (B, 64, T/16, 32, 32)
+            # Output: (B, 16, T/32, 32, 32)
             Conv3DBlock(
-                64, 128, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
+                16, 32, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)
             ),
-            # Output: (B, 128, T/32, 16, 16)
+            # Output: (B, 32, T/32, 16, 16)
             Conv3DBlock(
-                128, 256, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
+                32, 64, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
             ),
-            # Output: (B, 256, T/64, 8, 8)
+            # Output: (B, 64, T/64, 8, 8)
             Conv3DBlock(
-                256, 512, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
+                64, 128, kernel_size=(3, 3, 3), stride=(1, 2, 2), padding=(1, 1, 1)
             ),
-            # Output: (B, 512, T/128, 4, 4)
+            # Output: (B, 128, T/64, 4, 4)
             # Final spatial reduction
             nn.AdaptiveAvgPool3d((None, 1, 1)),  # Keep temporal dimension
-            # Output: (B, 512, T/128, 1, 1)
+            # Output: (B, 128, T/64, 1, 1)
         )
 
         # Temporal aggregation with learnable pooling
-        self.temporal_conv = nn.Conv1d(512, 512, kernel_size=3, padding=1)
-        self.temporal_attention = nn.Conv1d(512, 1, kernel_size=1)
+        self.temporal_conv = nn.Conv1d(128, 128, kernel_size=3, padding=1)
+        self.temporal_attention = nn.Conv1d(128, 1, kernel_size=1)
 
         # Final projection to embedding
         self.projector = nn.Sequential(
-            nn.Linear(512, 512),
+            nn.Linear(128, 128),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(512, embedding_dim),
+            nn.Linear(128, embedding_dim),
         )
 
         # Temperature for contrastive learning
