@@ -23,37 +23,6 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[:, : x.size(1)]
 
 
-class TemporalAttentionBlock(nn.Module):
-    """Attention block for temporal features with 1D convolutions."""
-
-    def __init__(self, dim, num_heads=8, mlp_ratio=4, drop=0.1):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            dim, num_heads, dropout=drop, batch_first=True
-        )
-        self.norm2 = nn.LayerNorm(dim)
-
-        self.conv1 = nn.Conv1d(dim, dim * mlp_ratio, 1)
-        self.act = nn.GELU()
-        self.conv2 = nn.Conv1d(dim * mlp_ratio, dim, 1)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        # Self-attention
-        x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
-        x = x + self.drop(attn_out)
-
-        x_norm = self.norm2(x)
-        x_conv = rearrange(x_norm, "b t c -> b c t")
-        x_conv = self.conv2(self.drop(self.act(self.conv1(x_conv))))
-        x_conv = rearrange(x_conv, "b c t -> b t c")
-        x = x + self.drop(x_conv)
-
-        return x
-
-
 class SpatialEncoder(nn.Module):
     """Lightweight spatial encoder to reduce 64x64 -> compact features."""
 
@@ -84,6 +53,37 @@ class SpatialEncoder(nn.Module):
 
     def forward(self, x):
         return self.encoder(x)
+
+
+class TemporalAttentionBlock(nn.Module):
+    """Attention block for temporal features with 1D convolutions."""
+
+    def __init__(self, dim, num_heads=8, mlp_ratio=4, drop=0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=drop, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(dim)
+
+        self.conv1 = nn.Conv1d(dim, dim * mlp_ratio, 1)
+        self.act = nn.GELU()
+        self.conv2 = nn.Conv1d(dim * mlp_ratio, dim, 1)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        # Self-attention
+        x_norm = self.norm1(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        x = x + self.drop(attn_out)
+
+        x_norm = self.norm2(x)
+        x_conv = rearrange(x_norm, "b t c -> b c t")
+        x_conv = self.conv2(self.drop(self.act(self.conv1(x_conv))))
+        x_conv = rearrange(x_conv, "b c t -> b t c")
+        x = x + self.drop(x_conv)
+
+        return x
 
 
 class TemporalConvBlock(nn.Module):
@@ -294,12 +294,199 @@ class VideoFingerprintAttention(nn.Module):
         }
 
 
-def create_attention_model(
-    spatial_dim=128, temporal_dim=256, embedding_dim=256, num_attention_blocks=4
-):
-    return VideoFingerprintAttention(
-        spatial_dim=spatial_dim,
-        temporal_dim=temporal_dim,
-        embedding_dim=embedding_dim,
-        num_attention_blocks=num_attention_blocks,
-    )
+class Conv3DBlock(nn.Module):
+    """Basic 3D convolution block with BatchNorm and ReLU."""
+
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0):
+        super().__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size, stride, padding)
+        self.bn = nn.BatchNorm3d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+
+class VideoFingerprint3D(nn.Module):
+    """Fast 3D CNN model for video fingerprinting with temporal striding."""
+
+    def __init__(self, embedding_dim=256, frame_stride=16, dropout=0.2):
+        super().__init__()
+
+        self.frame_stride = frame_stride
+        self.embedding_dim = embedding_dim
+
+        self.encoder = nn.Sequential(
+            # First layer: aggressive temporal stride
+            Conv3DBlock(
+                3,
+                64,
+                kernel_size=(frame_stride, 5, 5),
+                stride=(frame_stride, 2, 2),
+                padding=(0, 2, 2),
+            ),
+            # Output: (B, 64, T/16, 32, 32)
+            Conv3DBlock(
+                64, 128, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
+            ),
+            # Output: (B, 128, T/32, 16, 16)
+            Conv3DBlock(
+                128, 256, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
+            ),
+            # Output: (B, 256, T/64, 8, 8)
+            Conv3DBlock(
+                256, 512, kernel_size=(3, 3, 3), stride=(2, 2, 2), padding=(1, 1, 1)
+            ),
+            # Output: (B, 512, T/128, 4, 4)
+            # Final spatial reduction
+            nn.AdaptiveAvgPool3d((None, 1, 1)),  # Keep temporal dimension
+            # Output: (B, 512, T/128, 1, 1)
+        )
+
+        # Temporal aggregation with learnable pooling
+        self.temporal_conv = nn.Conv1d(512, 512, kernel_size=3, padding=1)
+        self.temporal_attention = nn.Conv1d(512, 1, kernel_size=1)
+
+        # Final projection to embedding
+        self.projector = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(512, embedding_dim),
+        )
+
+        # Temperature for contrastive learning
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """Initialize weights with better defaults for 3D convolutions."""
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm3d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, video):
+        """Forward pass for video fingerprinting."""
+        if video.dim() == 5 and video.shape[2] == 3:  # (B, T, C, H, W)
+            video = rearrange(video, "b t c h w -> b c t h w")
+
+        B, C, T, H, W = video.shape
+
+        # Pad temporal dimension to be divisible by frame_stride
+        pad_frames = (self.frame_stride - T % self.frame_stride) % self.frame_stride
+        if pad_frames > 0:
+            video = F.pad(video, (0, 0, 0, 0, 0, pad_frames), mode="constant", value=0)
+
+        # 3D CNN encoding
+        features = self.encoder(video)  # (B, 512, T', 1, 1)
+        features = features.squeeze(-1).squeeze(-1)  # (B, 512, T')
+
+        # Temporal aggregation with attention
+        temporal_features = self.temporal_conv(features)  # (B, 512, T')
+
+        # Compute attention weights
+        attention_weights = self.temporal_attention(temporal_features)  # (B, 1, T')
+        attention_weights = F.softmax(attention_weights, dim=2)
+
+        # Weighted pooling
+        weighted_features = (temporal_features * attention_weights).sum(
+            dim=2
+        )  # (B, 512)
+
+        # Also compute average pooling for robustness
+        avg_features = temporal_features.mean(dim=2)  # (B, 512)
+
+        # Combine both pooling methods
+        combined_features = weighted_features + avg_features
+
+        # Final projection
+        embedding = self.projector(combined_features)
+
+        # L2 normalization
+        embedding = F.normalize(embedding, p=2, dim=1)
+
+        return embedding
+
+    def compute_loss(self, video1, video2, hard_negative_ratio=0.3):
+        """Compute contrastive loss between video pairs."""
+        B = video1.shape[0]
+
+        # Get embeddings
+        emb1 = self.forward(video1)
+        emb2 = self.forward(video2)
+
+        # Compute similarity matrix
+        logits = torch.matmul(emb1, emb2.T) / self.temperature
+
+        # Labels: diagonal elements are positive pairs
+        labels = torch.arange(B, device=logits.device)
+
+        # Standard contrastive loss
+        loss_12 = F.cross_entropy(logits, labels)
+        loss_21 = F.cross_entropy(logits.T, labels)
+
+        # Hard negative mining
+        with torch.no_grad():
+            # Find hardest negatives (highest similarity among negatives)
+            mask = torch.eye(B, device=logits.device).bool()
+            neg_logits = logits.masked_fill(mask, float("-inf"))
+
+            # Get top-k hard negatives
+            k = max(1, int(B * hard_negative_ratio))
+            hard_indices = torch.topk(neg_logits, k, dim=1).indices
+
+        # Compute hard negative loss
+        hard_logits = torch.gather(logits, 1, hard_indices)
+        hard_labels = torch.zeros(B, dtype=torch.long, device=logits.device)
+
+        # Create new logits with positive and hard negatives
+        pos_logits = torch.diagonal(logits).unsqueeze(1)
+        hard_loss_logits = torch.cat([pos_logits, hard_logits], dim=1)
+        hard_loss = F.cross_entropy(hard_loss_logits, hard_labels)
+
+        # Total loss
+        total_loss = (loss_12 + loss_21) / 2 + 0.5 * hard_loss
+
+        return {
+            "loss": total_loss,
+            "loss_standard": (loss_12 + loss_21) / 2,
+            "loss_hard": hard_loss,
+            "temperature": self.temperature.item(),
+        }
+
+
+def create_model(model_type="attention", **kwargs):
+    """
+    Create a video fingerprint model.
+
+    Args:
+        model_type: 'attention' or '3d' or 'cnn3d'
+        **kwargs: Model-specific parameters
+
+    Returns:
+        Model instance
+    """
+    if model_type == "attention":
+        return VideoFingerprintAttention(
+            spatial_dim=kwargs.get("spatial_dim", 128),
+            temporal_dim=kwargs.get("temporal_dim", 256),
+            embedding_dim=kwargs.get("embedding_dim", 256),
+            num_attention_blocks=kwargs.get("num_attention_blocks", 4),
+        )
+    elif model_type in ["3d", "cnn3d"]:
+        return VideoFingerprint3D(
+            embedding_dim=kwargs.get("embedding_dim", 256),
+            frame_stride=kwargs.get("frame_stride", 16),
+            dropout=kwargs.get("dropout", 0.2),
+        )
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")

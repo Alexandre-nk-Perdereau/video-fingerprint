@@ -10,6 +10,7 @@ import argparse
 from datetime import datetime
 import json
 import sys
+import time
 
 
 class Trainer:
@@ -19,6 +20,7 @@ class Trainer:
         self.val_loader = val_loader
         self.config = config
         self.run_dir = Path(run_dir)
+        self.model_type = config.get("model_type", "attention")
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
@@ -27,23 +29,26 @@ class Trainer:
             torch.amp.GradScaler("cuda") if config.get("use_amp", True) else None
         )
 
-        param_groups = [
-            {
-                "params": self.model.spatial_encoder.parameters(),
-                "lr": config["lr_spatial"],
-            },
-            {
-                "params": self.model.attention_blocks.parameters(),
-                "lr": config["lr_attention"],
-            },
-            {
-                "params": [
-                    p
-                    for n, p in self.model.named_parameters()
-                    if "spatial_encoder" not in n and "attention_blocks" not in n
-                ]
-            },
-        ]
+        if self.model_type == "attention":
+            param_groups = [
+                {
+                    "params": self.model.spatial_encoder.parameters(),
+                    "lr": config["lr_spatial"],
+                },
+                {
+                    "params": self.model.attention_blocks.parameters(),
+                    "lr": config["lr_attention"],
+                },
+                {
+                    "params": [
+                        p
+                        for n, p in self.model.named_parameters()
+                        if "spatial_encoder" not in n and "attention_blocks" not in n
+                    ]
+                },
+            ]
+        else:  # 3D model
+            param_groups = self.model.parameters()
 
         self.optimizer = optim.AdamW(
             param_groups,
@@ -52,18 +57,25 @@ class Trainer:
             betas=(0.9, 0.999),
         )
 
-        num_training_steps = len(train_loader) * config["epochs"]
-        num_warmup_steps = num_training_steps // 10
-
-        def lr_lambda(step):
-            if step < num_warmup_steps:
-                return float(step) / float(max(1, num_warmup_steps))
-            progress = float(step - num_warmup_steps) / float(
-                max(1, num_training_steps - num_warmup_steps)
+        if self.model_type == "3d":
+            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer,
+                T_max=config["epochs"],
+                eta_min=config["learning_rate"] * 0.01,
             )
-            return max(0.1, 0.5 * (1.0 + np.cos(np.pi * progress)))
+        else:
+            num_training_steps = len(train_loader) * config["epochs"]
+            num_warmup_steps = num_training_steps // 10
 
-        self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
+            def lr_lambda(step):
+                if step < num_warmup_steps:
+                    return float(step) / float(max(1, num_warmup_steps))
+                progress = float(step - num_warmup_steps) / float(
+                    max(1, num_training_steps - num_warmup_steps)
+                )
+                return max(0.1, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda)
 
         self.checkpoint_dir = self.run_dir / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -89,6 +101,7 @@ class Trainer:
                 f"Training started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
             f.write(f"Device: {self.device}\n")
+            f.write(f"Model type: {self.model_type}\n")
             f.write(
                 f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}\n"
             )
@@ -96,15 +109,26 @@ class Trainer:
                 f"Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}\n"
             )
             f.write("\nModel Architecture:\n")
-            f.write(f"  - Spatial dimension: {self.config.get('spatial_dim', 128)}\n")
-            f.write(f"  - Temporal dimension: {self.config.get('temporal_dim', 256)}\n")
+            if self.model_type == "attention":
+                f.write(
+                    f"  - Spatial dimension: {self.config.get('spatial_dim', 128)}\n"
+                )
+                f.write(
+                    f"  - Temporal dimension: {self.config.get('temporal_dim', 256)}\n"
+                )
+                f.write(
+                    f"  - Number of attention blocks: {self.config.get('num_attention_blocks', 4)}\n"
+                )
+            else:  # 3D model
+                f.write(f"  - Frame stride: {self.config.get('frame_stride', 16)}\n")
+                f.write(f"  - Clip length: {self.config.get('clip_length', 128)}\n")
             f.write(f"  - Embedding dimension: {self.config['embedding_dim']}\n")
-            f.write(
-                f"  - Number of attention blocks: {self.config.get('num_attention_blocks', 4)}\n"
-            )
             f.write("\nData Configuration:\n")
             f.write(f"  - Frame size: {self.config['frame_size']}\n")
-            f.write(f"  - Max frames: {self.config['max_frames']}\n")
+            if self.model_type == "attention":
+                f.write(f"  - Max frames: {self.config['max_frames']}\n")
+            else:
+                f.write(f"  - Clip length: {self.config['clip_length']}\n")
             f.write(f"  - Batch size: {self.config['batch_size']}\n")
             f.write(f"  - Number of training batches: {len(self.train_loader)}\n")
             f.write(f"  - Number of validation batches: {len(self.val_loader)}\n")
@@ -115,30 +139,49 @@ class Trainer:
         """Train the model for one epoch."""
         self.model.train()
 
-        metrics = {
-            "loss": 0,
-            "loss_full": 0,
-            "loss_extract": 0,
-            "loss_extract_cross": 0,
-            "acc": 0,
-        }
+        metrics = {"loss": 0, "acc": 0, "time_per_batch": 0}
+
+        if self.model_type == "attention":
+            metrics.update(
+                {
+                    "loss_full": 0,
+                    "loss_extract": 0,
+                    "loss_extract_cross": 0,
+                }
+            )
+        else:  # 3D model
+            metrics.update(
+                {
+                    "loss_standard": 0,
+                    "loss_hard": 0,
+                }
+            )
+
         num_batches = 0
 
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
 
         for batch in pbar:
+            start_time = time.time()
+
             clip1 = batch["clip1"].to(self.device)
             clip2 = batch["clip2"].to(self.device)
 
             if self.scaler:
                 with torch.amp.autocast("cuda"):
+                    if self.model_type == "attention":
+                        output = self.model.compute_loss(
+                            clip1, clip2, extract_ratio=self.config["min_extract_ratio"]
+                        )
+                    else:  # 3D model
+                        output = self.model.compute_loss(clip1, clip2)
+            else:
+                if self.model_type == "attention":
                     output = self.model.compute_loss(
                         clip1, clip2, extract_ratio=self.config["min_extract_ratio"]
                     )
-            else:
-                output = self.model.compute_loss(
-                    clip1, clip2, extract_ratio=self.config["min_extract_ratio"]
-                )
+                else:  # 3D model
+                    output = self.model.compute_loss(clip1, clip2)
 
             loss = output["loss"]
 
@@ -154,7 +197,9 @@ class Trainer:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
-            self.scheduler.step()
+
+            if self.model_type == "attention":
+                self.scheduler.step()
 
             with torch.no_grad():
                 emb1 = self.model(clip1)
@@ -164,17 +209,27 @@ class Trainer:
                 targets = torch.arange(logits.shape[0], device=self.device)
                 acc = (preds == targets).float().mean()
 
+                batch_time = time.time() - start_time
+                metrics["time_per_batch"] += batch_time
+
                 for key in output:
                     if key.startswith("loss"):
-                        metrics[key] += output[key].item()
+                        if key in metrics:
+                            metrics[key] += output[key].item()
                 metrics["acc"] += acc.item()
                 num_batches += 1
+
+                if self.model_type == "attention":
+                    current_lr = self.scheduler.get_last_lr()[0]
+                else:
+                    current_lr = self.optimizer.param_groups[0]["lr"]
 
                 pbar.set_postfix(
                     {
                         "loss": f"{loss.item():.4f}",
                         "acc": f"{acc.item():.3f}",
-                        "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
+                        "lr": f"{current_lr:.2e}",
+                        "time": f"{batch_time:.2f}s",
                     }
                 )
 
@@ -185,9 +240,7 @@ class Trainer:
                     self.writer.add_scalar(
                         "Train/acc_step", acc.item(), self.global_step
                     )
-                    self.writer.add_scalar(
-                        "Train/lr", self.scheduler.get_last_lr()[0], self.global_step
-                    )
+                    self.writer.add_scalar("Train/lr", current_lr, self.global_step)
 
                 self.global_step += 1
 
@@ -201,11 +254,25 @@ class Trainer:
 
         metrics = {
             "loss": 0,
-            "loss_full": 0,
-            "loss_extract": 0,
-            "loss_extract_cross": 0,
             "acc": 0,
         }
+
+        if self.model_type == "attention":
+            metrics.update(
+                {
+                    "loss_full": 0,
+                    "loss_extract": 0,
+                    "loss_extract_cross": 0,
+                }
+            )
+        else:  # 3D model
+            metrics.update(
+                {
+                    "loss_standard": 0,
+                    "loss_hard": 0,
+                }
+            )
+
         num_batches = 0
 
         all_embeddings = []
@@ -233,7 +300,8 @@ class Trainer:
 
                 for key in output:
                     if key.startswith("loss"):
-                        metrics[key] += output[key].item()
+                        if key in metrics:
+                            metrics[key] += output[key].item()
                 metrics["acc"] += acc.item()
                 num_batches += 1
 
@@ -249,8 +317,9 @@ class Trainer:
         )
         metrics.update(retrieval_metrics)
 
-        extract_metrics = self._test_extract_robustness()
-        metrics.update(extract_metrics)
+        if self.model_type == "attention":
+            extract_metrics = self._test_extract_robustness()
+            metrics.update(extract_metrics)
 
         return metrics
 
@@ -384,10 +453,11 @@ class Trainer:
             f.write(f"{val_metrics.get('R@1', 0):4.2f} | ")
             f.write(f"{val_metrics.get('R@5', 0):4.2f} | ")
             f.write(f"{val_metrics.get('mAP', 0):4.2f} | ")
-            f.write(f"{'✓' if is_best else ' '}\n")
+            f.write(f"{'V' if is_best else 'X'}\n")
 
     def train(self):
         print(f"Training on {self.device}")
+        print(f"Model type: {self.model_type}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         print(
             f"Trainable parameters: {sum(p.numel() for p in self.model.parameters() if p.requires_grad):,}"
@@ -404,10 +474,13 @@ class Trainer:
             train_metrics = self.train_epoch()
             val_metrics = self.validate()
 
+            if self.model_type == "3d":
+                self.scheduler.step()
+
             print(f"\n{'=' * 50}")
             print(f"Epoch {epoch}/{self.config['epochs']}")
             print(
-                f"Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['acc']:.3f}"
+                f"Train - Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['acc']:.3f}, Time/batch: {train_metrics['time_per_batch']:.2f}s"
             )
             print(
                 f"Val   - Loss: {val_metrics['loss']:.4f}, Acc: {val_metrics['acc']:.3f}"
@@ -415,9 +488,11 @@ class Trainer:
             print(
                 f"Val   - R@1: {val_metrics.get('R@1', 0):.3f}, R@5: {val_metrics.get('R@5', 0):.3f}, mAP: {val_metrics.get('mAP', 0):.3f}"
             )
-            print(
-                f"Extract Robustness - 50%: {val_metrics.get('extract_sim_50', 0):.3f}, 70%: {val_metrics.get('extract_sim_70', 0):.3f}"
-            )
+
+            if self.model_type == "attention":
+                print(
+                    f"Extract Robustness - 50%: {val_metrics.get('extract_sim_50', 0):.3f}, 70%: {val_metrics.get('extract_sim_70', 0):.3f}"
+                )
 
             for key, value in train_metrics.items():
                 self.writer.add_scalar(f"Train/{key}", value, epoch)
@@ -460,6 +535,7 @@ class Trainer:
             f.write(
                 f"Training completed: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             )
+            f.write(f"Model type: {self.model_type}\n")
             f.write(f"Total epochs: {self.epoch + 1}\n")
             f.write(f"Best validation accuracy: {self.best_val_acc:.4f}\n")
             f.write(f"Best validation loss: {self.best_val_loss:.4f}\n")
@@ -470,10 +546,10 @@ class Trainer:
         print(f"Results saved to: {self.run_dir}")
 
 
-def setup_run_directory(base_dir="./runs"):
+def setup_run_directory(base_dir="./runs", prefix=""):
     """Create a unique run directory with timestamp."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"run_{timestamp}"
+    run_name = f"{prefix}run_{timestamp}"
     run_dir = Path(base_dir) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -487,7 +563,7 @@ def setup_run_directory(base_dir="./runs"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train Video Fingerprint Model with Attention"
+        description="Train Video Fingerprint Model (Attention or 3D CNN)"
     )
     parser.add_argument(
         "--data_dir", type=str, required=True, help="Path to video dataset"
@@ -508,6 +584,19 @@ def main():
     parser.add_argument(
         "--patience", type=int, default=10, help="Early stopping patience"
     )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="attention",
+        choices=["attention", "3d"],
+        help="Model type to train (attention or 3d)",
+    )
+    parser.add_argument(
+        "--clip_length", type=int, default=128, help="Clip length for 3D model"
+    )
+    parser.add_argument(
+        "--frame_stride", type=int, default=16, help="Frame stride for 3D model"
+    )
 
     args = parser.parse_args()
 
@@ -515,17 +604,24 @@ def main():
         run_dir = Path("./runs") / args.run_name
         run_dir.mkdir(parents=True, exist_ok=True)
     else:
-        run_dir = setup_run_directory()
+        model_prefix = "3d_" if args.model == "3d" else ""
+        run_dir = setup_run_directory(prefix=model_prefix)
+
+    batch_size = args.batch_size if args.model == "attention" else args.batch_size * 2
+
+    lr = args.lr if args.model == "attention" else args.lr * 3
 
     config = {
-        "batch_size": args.batch_size,
+        "batch_size": batch_size,
         "epochs": args.epochs,
-        "learning_rate": args.lr,
-        "lr_spatial": args.lr * 0.1,
-        "lr_attention": args.lr * 0.5,
+        "learning_rate": lr,
+        "lr_spatial": lr * 0.1,  # Only used for attention model
+        "lr_attention": lr * 0.5,  # Only used for attention model
         "weight_decay": 1e-4,
         "frame_size": 64,
-        "max_frames": 500,
+        "max_frames": 500,  # For attention model
+        "clip_length": args.clip_length,  # For 3D model
+        "frame_stride": args.frame_stride,  # For 3D model
         "embedding_dim": 256,
         "spatial_dim": 128,
         "temporal_dim": 256,
@@ -535,17 +631,20 @@ def main():
         "patience": args.patience,
         "data_dir": str(args.data_dir),
         "num_workers": args.num_workers,
+        "model_type": args.model,
         "command_line": " ".join(sys.argv),
     }
 
-    from model import create_attention_model
+    from model import create_model
     from dataset import create_dataloader
 
-    model = create_attention_model(
+    model = create_model(
+        model_type=args.model,
         spatial_dim=config["spatial_dim"],
         temporal_dim=config["temporal_dim"],
         embedding_dim=config["embedding_dim"],
         num_attention_blocks=config["num_attention_blocks"],
+        frame_stride=config["frame_stride"],
     )
 
     train_loader = create_dataloader(
@@ -554,16 +653,24 @@ def main():
         num_workers=args.num_workers,
         frame_size=config["frame_size"],
         max_frames=config["max_frames"],
+        clip_length=config["clip_length"],
+        frame_stride=config["frame_stride"],
         mode="train",
+        model_type=args.model,
     )
 
     val_loader = create_dataloader(
         args.data_dir,
-        batch_size=config["batch_size"] * 2,
+        batch_size=config["batch_size"] * 2
+        if args.model == "attention"
+        else config["batch_size"],
         num_workers=args.num_workers,
         frame_size=config["frame_size"],
         max_frames=config["max_frames"],
+        clip_length=config["clip_length"],
+        frame_stride=config["frame_stride"],
         mode="val",
+        model_type=args.model,
     )
 
     trainer = Trainer(model, train_loader, val_loader, config, run_dir)

@@ -20,19 +20,23 @@ class VideoFingerprintDataset(Dataset):
         video_dir,
         frame_size=64,
         max_frames=1000,
-        chunk_size=300,
+        clip_length=128,  # For 3D CNN mode
+        frame_stride=16,  # For 3D CNN mode
         min_extract_ratio=0.5,
         augment=True,
         cache_videos=True,
         mode="train",
+        model_type="attention",  # 'attention' or '3d'
     ):
         self.video_dir = Path(video_dir)
         self.frame_size = frame_size
         self.max_frames = max_frames
-        self.chunk_size = chunk_size
+        self.clip_length = clip_length
+        self.frame_stride = frame_stride
         self.min_extract_ratio = min_extract_ratio
         self.augment = augment
         self.mode = mode
+        self.model_type = model_type
         self.cache_videos = cache_videos
         self._cache = {}
 
@@ -40,18 +44,70 @@ class VideoFingerprintDataset(Dataset):
         for ext in ["*.mp4", "*.avi", "*.mov", "*.mkv"]:
             self.video_paths.extend(list(self.video_dir.glob(f"**/{ext}")))
 
-        self.video_chunks = []
-        for video_path in self.video_paths:
-            self.video_chunks.append(
-                {"path": video_path, "chunk_idx": 0, "video_id": len(self.video_chunks)}
-            )
+        if model_type == "attention":
+            self.samples = []
+            for video_path in self.video_paths:
+                self.samples.append({"path": video_path, "video_id": len(self.samples)})
+        else:
+            self._create_3d_clips_metadata()
 
         print(f"Found {len(self.video_paths)} videos")
+        print(f"Dataset mode: {model_type}, Total samples: {len(self)}")
+
+    def _create_3d_clips_metadata(self):
+        """Create metadata for 3D CNN clips."""
+        self.samples = []
+
+        for video_id, video_path in enumerate(self.video_paths):
+            try:
+                container = av.open(str(video_path))
+                stream = container.streams.video[0]
+                total_frames = stream.frames
+
+                if total_frames == 0:
+                    total_frames = int(stream.duration * stream.average_rate)
+
+                container.close()
+
+                if total_frames >= self.clip_length:
+                    if self.mode == "train":
+                        num_clips = min(5, (total_frames - self.clip_length) // 32 + 1)
+                        for i in range(num_clips):
+                            self.samples.append(
+                                {
+                                    "path": video_path,
+                                    "video_id": video_id,
+                                    "total_frames": total_frames,
+                                    "clip_idx": i,
+                                }
+                            )
+                    else:
+                        self.samples.append(
+                            {
+                                "path": video_path,
+                                "video_id": video_id,
+                                "total_frames": total_frames,
+                                "clip_idx": 0,
+                            }
+                        )
+                else:
+                    self.samples.append(
+                        {
+                            "path": video_path,
+                            "video_id": video_id,
+                            "total_frames": total_frames,
+                            "clip_idx": 0,
+                        }
+                    )
+
+            except Exception as e:
+                print(f"Error processing {video_path}: {e}")
 
     def __len__(self):
-        return len(self.video_chunks)
+        return len(self.samples)
 
     def _load_video_full(self, video_path):
+        """Load all frames from a video (for attention model)."""
         if self.cache_videos and str(video_path) in self._cache:
             return self._cache[str(video_path)]
 
@@ -94,7 +150,45 @@ class VideoFingerprintDataset(Dataset):
 
         return frames
 
+    def _load_clip_frames(self, video_path, start_frame, num_frames):
+        """Load a contiguous clip of frames (for 3D CNN model)."""
+        frames = []
+
+        try:
+            container = av.open(str(video_path))
+            stream = container.streams.video[0]
+
+            stream.codec_context.skip_frame = "NONKEY"
+            container.seek(start_frame, stream=stream)
+            stream.codec_context.skip_frame = "DEFAULT"
+
+            frame_count = 0
+            for frame in container.decode(stream):
+                if frame_count >= num_frames:
+                    break
+
+                img = frame.to_ndarray(format="rgb24")
+                frames.append(img)
+                frame_count += 1
+
+            container.close()
+
+        except Exception as e:
+            print(f"Error loading clip from {video_path}: {e}")
+            frames = [
+                np.zeros((480, 640, 3), dtype=np.uint8) for _ in range(num_frames)
+            ]
+
+        while len(frames) < num_frames:
+            if len(frames) > 0:
+                frames.append(frames[-1])
+            else:
+                frames.append(np.zeros((480, 640, 3), dtype=np.uint8))
+
+        return frames[:num_frames]
+
     def _resize_frame(self, frame):
+        """Center crop and resize frame to target size."""
         h, w = frame.shape[:2]
 
         if h < w:
@@ -173,6 +267,7 @@ class VideoFingerprintDataset(Dataset):
         return augmented
 
     def _create_extract_pair(self, frames):
+        """Create a pair of video extracts (for attention model)."""
         n_frames = len(frames)
 
         if self.mode == "train":
@@ -204,12 +299,39 @@ class VideoFingerprintDataset(Dataset):
 
         return extract1, extract2
 
+    def _get_clip_start_position(self, clip_info):
+        """Determine the starting frame for a clip (for 3D CNN model)."""
+        total_frames = clip_info["total_frames"]
+
+        if total_frames <= self.clip_length:
+            return 0
+
+        if self.mode == "train":
+            max_start = total_frames - self.clip_length
+            return random.randint(0, max_start)
+        else:
+            clip_idx = clip_info["clip_idx"]
+            if clip_idx == 0:
+                return (total_frames - self.clip_length) // 2
+            else:
+                num_positions = 5
+                position = clip_idx % num_positions
+                return (
+                    position * (total_frames - self.clip_length) // (num_positions - 1)
+                )
+
     def __getitem__(self, idx):
-        chunk_info = self.video_chunks[idx]
-        video_path = chunk_info["path"]
+        if self.model_type == "attention":
+            return self._get_attention_item(idx)
+        else:
+            return self._get_3d_item(idx)
+
+    def _get_attention_item(self, idx):
+        """Get item for attention model."""
+        sample_info = self.samples[idx]
+        video_path = sample_info["path"]
 
         all_frames = self._load_video_full(video_path)
-
         frames1, frames2 = self._create_extract_pair(all_frames)
 
         frames1 = [self._resize_frame(f) for f in frames1]
@@ -227,12 +349,46 @@ class VideoFingerprintDataset(Dataset):
         return {
             "clip1": clip1,  # (T1, C, H, W)
             "clip2": clip2,  # (T2, C, H, W)
-            "video_id": chunk_info["video_id"],
+            "video_id": sample_info["video_id"],
             "lengths": torch.tensor([len(frames1), len(frames2)]),
         }
 
+    def _get_3d_item(self, idx):
+        """Get item for 3D CNN model."""
+        clip_info = self.samples[idx]
+        video_path = clip_info["path"]
+
+        start1 = self._get_clip_start_position(clip_info)
+        start2 = self._get_clip_start_position(clip_info)
+
+        if self.mode == "train" and random.random() > 0.3:
+            max_offset = self.clip_length // 2
+            offset = random.randint(-max_offset, max_offset)
+            start2 = max(
+                0, min(start1 + offset, clip_info["total_frames"] - self.clip_length)
+            )
+
+        frames1 = self._load_clip_frames(video_path, start1, self.clip_length)
+        frames2 = self._load_clip_frames(video_path, start2, self.clip_length)
+
+        frames1 = [self._resize_frame(f) for f in frames1]
+        frames2 = [self._resize_frame(f) for f in frames2]
+
+        frames1 = self._apply_augmentations(frames1)
+        frames2 = self._apply_augmentations(frames2)
+
+        clip1 = torch.from_numpy(np.stack(frames1)).float() / 255.0
+        clip2 = torch.from_numpy(np.stack(frames2)).float() / 255.0
+
+        # (T, H, W, C) -> (T, C, H, W)
+        clip1 = clip1.permute(0, 3, 1, 2)
+        clip2 = clip2.permute(0, 3, 1, 2)
+
+        return {"clip1": clip1, "clip2": clip2, "video_id": clip_info["video_id"]}
+
 
 def collate_fn_padding(batch):
+    """Collate function for attention model with padding."""
     clips1 = [item["clip1"] for item in batch]
     clips2 = [item["clip2"] for item in batch]
     video_ids = torch.tensor([item["video_id"] for item in batch])
@@ -268,22 +424,49 @@ def collate_fn_padding(batch):
 
 
 def create_dataloader(
-    video_dir, batch_size=8, num_workers=4, frame_size=64, max_frames=500, mode="train"
+    video_dir,
+    batch_size=8,
+    num_workers=4,
+    frame_size=64,
+    max_frames=500,
+    clip_length=128,
+    frame_stride=16,
+    mode="train",
+    model_type="attention",
 ):
+    """
+    Create a dataloader for video fingerprinting.
+
+    Args:
+        video_dir: Path to video directory
+        batch_size: Batch size
+        num_workers: Number of data loading workers
+        frame_size: Target frame size
+        max_frames: Max frames for attention model
+        clip_length: Clip length for 3D model
+        frame_stride: Frame stride for 3D model
+        mode: 'train' or 'val'
+        model_type: 'attention' or '3d'
+    """
     dataset = VideoFingerprintDataset(
         video_dir=video_dir,
         frame_size=frame_size,
         max_frames=max_frames,
+        clip_length=clip_length,
+        frame_stride=frame_stride,
         augment=(mode == "train"),
         mode=mode,
+        model_type=model_type,
     )
+
+    collate_fn = collate_fn_padding if model_type == "attention" else None
 
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=(mode == "train"),
         num_workers=num_workers,
-        collate_fn=collate_fn_padding,
+        collate_fn=collate_fn,
         pin_memory=True,
         drop_last=(mode == "train"),
     )
