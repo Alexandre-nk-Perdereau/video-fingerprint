@@ -13,6 +13,7 @@ from typing import List, Dict, Tuple, Optional
 
 class VideoFingerprintScanner:
     """Videos scanner for extracting fingerprints and detecting duplicates."""
+
     # TODO: parallelize, can't batch because of variable frame lengths
 
     def __init__(self, model_path: str, device: str = "cuda"):
@@ -432,7 +433,7 @@ Usage examples:
     parser.add_argument(
         "--threshold",
         type=float,
-        default=0.95,
+        default=0.99,
         help="Similarity threshold for duplicates (0-1, default: 0.95)",
     )
     parser.add_argument("--output", type=str, help="JSON file to save the results")
@@ -479,7 +480,7 @@ Usage examples:
         output_path = Path(args.output)
         scanner.save_results(fingerprints, duplicate_groups, output_path)
 
-    print(f"\nScan complete!")
+    print("\nScan complete!")
     return 0
 
 
